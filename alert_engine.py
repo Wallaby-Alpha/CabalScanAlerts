@@ -62,69 +62,83 @@ DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 # LOW-LEVEL HELIUS HELPERS  (same shape as app.py — kept independent on purpose
 # so this file can run with zero dependency on streamlit)
 # ══════════════════════════════════════════════════════════════════════════════
+def _helius_post(helius_url: str, payload: dict, timeout: int = 30, max_retries: int = 4,
+                  label: str = "") -> dict | None:
+    """
+    Shared POST wrapper for every Helius call. Retries with exponential backoff
+    specifically on 429 (rate limit), so a burst of requests slows down instead
+    of silently dropping wallets/tokens from the scan. Returns the parsed JSON
+    response dict, or None if it ultimately failed.
+    """
+    delay = 1.5
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.post(helius_url, json=payload, timeout=timeout)
+            if r.status_code == 429:
+                if attempt < max_retries:
+                    retry_after = r.headers.get("Retry-After")
+                    wait = float(retry_after) if retry_after else delay
+                    print(f"  [rate limited] {label} — retrying in {wait:.1f}s "
+                          f"(attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait)
+                    delay *= 2
+                    continue
+                print(f"  [rate limited] {label} — out of retries, giving up on this call.")
+                return None
+            r.raise_for_status()
+            data = r.json()
+            if "error" in data:
+                print(f"  [Helius error] {label}: {data['error']}")
+                return None
+            return data
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"  [request error] {label}: {e} — retrying in {delay:.1f}s")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            print(f"  [request failed] {label}: {e} — out of retries, giving up on this call.")
+            return None
+    return None
+
+
 def fetch_signatures(wallet: str, helius_url: str, limit: int = 150) -> list:
     payload = {"jsonrpc": "2.0", "id": "sigs", "method": "getSignaturesForAddress",
                "params": [wallet, {"limit": limit}]}
-    try:
-        r = requests.post(helius_url, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            print(f"  [Helius error] getSignaturesForAddress {wallet[:8]}...: {data['error']}")
-            return []
-        return data.get("result", [])
-    except Exception as e:
-        print(f"  [Request failed] getSignaturesForAddress {wallet[:8]}...: {e}")
-        return []
+    data = _helius_post(helius_url, payload, label=f"getSignaturesForAddress {wallet[:8]}...")
+    return data.get("result", []) if data else []
 
 
 def fetch_transaction(sig: str, helius_url: str):
     payload = {"jsonrpc": "2.0", "id": "tx", "method": "getTransaction",
                "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]}
-    try:
-        r = requests.post(helius_url, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            print(f"  [Helius error] getTransaction {sig[:12]}...: {data['error']}")
-            return None
-        return data.get("result")
-    except Exception as e:
-        print(f"  [Request failed] getTransaction {sig[:12]}...: {e}")
-        return None
+    data = _helius_post(helius_url, payload, label=f"getTransaction {sig[:12]}...")
+    return data.get("result") if data else None
 
 
 def get_token_largest_accounts(mint: str, helius_url: str) -> list:
     payload = {"jsonrpc": "2.0", "id": "tla", "method": "getTokenLargestAccounts",
                "params": [mint, {"commitment": "finalized"}]}
-    try:
-        r = requests.post(helius_url, json=payload, timeout=30)
-        r.raise_for_status()
-        return r.json().get("result", {}).get("value", [])
-    except Exception:
-        return []
+    data = _helius_post(helius_url, payload, label=f"getTokenLargestAccounts {mint[:8]}...")
+    return data.get("result", {}).get("value", []) if data else []
 
 
 def resolve_token_account_owner(token_account: str, helius_url: str) -> str:
     payload = {"jsonrpc": "2.0", "id": "gai", "method": "getAccountInfo",
                "params": [token_account, {"encoding": "jsonParsed"}]}
-    try:
-        r = requests.post(helius_url, json=payload, timeout=20)
-        r.raise_for_status()
-        parsed = r.json().get("result", {}).get("value", {}).get("data", {}).get("parsed", {})
-        return parsed.get("info", {}).get("owner", "")
-    except Exception:
+    data = _helius_post(helius_url, payload, timeout=20, label=f"getAccountInfo {token_account[:8]}...")
+    if not data:
         return ""
+    parsed = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {})
+    return parsed.get("info", {}).get("owner", "")
 
 
 def get_token_supply(mint: str, helius_url: str) -> float:
     payload = {"jsonrpc": "2.0", "id": "ts", "method": "getTokenSupply", "params": [mint]}
-    try:
-        r = requests.post(helius_url, json=payload, timeout=20)
-        r.raise_for_status()
-        return float(r.json().get("result", {}).get("value", {}).get("uiAmount") or 0)
-    except Exception:
+    data = _helius_post(helius_url, payload, timeout=20, label=f"getTokenSupply {mint[:8]}...")
+    if not data:
         return 0.0
+    return float(data.get("result", {}).get("value", {}).get("uiAmount") or 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -194,6 +208,8 @@ def aggregate_watchlist_activity(wallets: list, helius_url: str, lookback_hours:
             if d["bought"] > 0:
                 token_activity[mint][wallet] = d
 
+        time.sleep(0.15)  # courtesy gap between wallets on top of per-tx pacing, to reduce 429s
+
     # ── diagnostic: tells you whether "0 candidates" means quiet market vs broken API ──
     print(f"[diagnostic] {len(wallets) - wallets_with_zero_sigs}/{len(wallets)} wallets "
           f"returned at least one signature (any age) from Helius.")
@@ -253,15 +269,35 @@ def conviction_score(bought: float, sold: float, buy_txs: int, sell_txs: int) ->
     return round(0.7 * vol_score + 0.3 * tx_score, 1)
 
 
-def get_top_holder_pressure(mint: str, helius_url: str, top_n: int = 15, min_pct: float = 0.1) -> dict:
+def get_top_holder_pressure(mint: str, helius_url: str, price_usd: float = 0.0,
+                             top_n: int = 20, min_pct: float = 0.1,
+                             headline_window: str = "1d") -> dict:
     """
-    Returns {'score_0_100': x, 'windows': {...}, 'top10_pct_supply': y, 'n_holders': n}
-    Excludes exchange wallets. Blends 1d/2d/7d conviction, weighted toward recent.
+    'Top holders' = the top `top_n` token accounts by balance (default 20),
+    with known exchange wallets excluded (see EXCHANGE_WALLETS).
+
+    Returns:
+      score_0_100        - blended conviction score (0=heavy net selling, 50=neutral, 100=heavy net buying),
+                            combining 1d/2d/7d activity weighted 50/30/20 toward recent. This feeds the
+                            composite alert score.
+      windows            - per-window (1d/2d/7d) conviction score, -100..100, for finer-grained inspection
+      buying             - {count, usd}: how many of the top holders were net buyers in `headline_window`,
+                            and the total USD value of what they bought
+      selling            - {count, usd}: same, for net sellers
+      top10_pct_supply   - % of total supply held by the top 10 addresses (concentration/rug-risk proxy)
+      n_holders          - how many top-N holders were successfully resolved to owner wallets
+      top_n_considered   - the top_n value actually used (so callers/messages can state it explicitly)
     """
+    empty = {
+        "score_0_100": 50.0, "windows": {}, "top10_pct_supply": None, "n_holders": 0,
+        "top_n_considered": top_n, "headline_window": headline_window,
+        "buying": {"count": 0, "usd": 0.0}, "selling": {"count": 0, "usd": 0.0},
+    }
+
     total_supply = get_token_supply(mint, helius_url)
     largest = get_token_largest_accounts(mint, helius_url)
     if total_supply <= 0 or not largest:
-        return {"score_0_100": 50.0, "windows": {}, "top10_pct_supply": None, "n_holders": 0}
+        return empty
 
     top10_pct = sum(float(e.get("uiAmount") or 0) for e in largest[:10]) / total_supply * 100
 
@@ -278,12 +314,14 @@ def get_top_holder_pressure(mint: str, helius_url: str, top_n: int = 15, min_pct
         time.sleep(0.1)
 
     if not resolved:
-        return {"score_0_100": 50.0, "windows": {}, "top10_pct_supply": round(top10_pct, 2), "n_holders": 0}
+        empty["top10_pct_supply"] = round(top10_pct, 2)
+        return empty
 
     now_ts = int(datetime.now(timezone.utc).timestamp())
     windows = {"1d": 1, "2d": 2, "7d": 7}
     cutoffs = {k: now_ts - v * 86400 for k, v in windows.items()}
     window_scores = defaultdict(list)
+    wallet_window_flows = {}  # wallet -> {wname: {bought, sold, buy_txs, sell_txs}}
 
     for wallet in resolved:
         sigs = fetch_signatures(wallet, helius_url, limit=150)
@@ -311,23 +349,45 @@ def get_top_holder_pressure(mint: str, helius_url: str, top_n: int = 15, min_pct
                     txs.append({"delta": delta, "ts": bt})
             time.sleep(0.07)
 
+        wallet_window_flows[wallet] = {}
         for wname, _ in windows.items():
             relevant = [t for t in txs if t["ts"] >= cutoffs[wname]]
             bought = sum(t["delta"] for t in relevant if t["delta"] > 0)
             sold = sum(abs(t["delta"]) for t in relevant if t["delta"] < 0)
             buy_txs = sum(1 for t in relevant if t["delta"] > 0)
             sell_txs = sum(1 for t in relevant if t["delta"] < 0)
+            wallet_window_flows[wallet][wname] = {
+                "bought": bought, "sold": sold, "buy_txs": buy_txs, "sell_txs": sell_txs,
+            }
             window_scores[wname].append(conviction_score(bought, sold, buy_txs, sell_txs))
 
     window_avgs = {w: (sum(s) / len(s) if s else 0) for w, s in window_scores.items()}
     blended = 0.5 * window_avgs.get("1d", 0) + 0.3 * window_avgs.get("2d", 0) + 0.2 * window_avgs.get("7d", 0)
     score_0_100 = round((blended + 100) / 2, 1)  # map -100..100 -> 0..100
 
+    # Headline buying/selling snapshot: classify each top holder by net direction
+    # in `headline_window` (default 1d — the most immediately actionable signal).
+    buying_count, selling_count = 0, 0
+    buying_usd, selling_usd = 0.0, 0.0
+    for wallet, wf in wallet_window_flows.items():
+        flow = wf.get(headline_window, {})
+        net = flow.get("bought", 0) - flow.get("sold", 0)
+        if net > 0:
+            buying_count += 1
+            buying_usd += flow["bought"] * price_usd
+        elif net < 0:
+            selling_count += 1
+            selling_usd += flow["sold"] * price_usd
+
     return {
         "score_0_100": score_0_100,
         "windows": {w: round(v, 1) for w, v in window_avgs.items()},
         "top10_pct_supply": round(top10_pct, 2),
         "n_holders": len(resolved),
+        "top_n_considered": top_n,
+        "headline_window": headline_window,
+        "buying": {"count": buying_count, "usd": round(buying_usd, 2)},
+        "selling": {"count": selling_count, "usd": round(selling_usd, 2)},
     }
 
 
@@ -369,11 +429,14 @@ def score_token(mint: str, wallet_data: dict, helius_url: str) -> dict:
     market = get_token_market_data(mint) or {}
     price = market.get("price_usd", 0)
 
-    total_usd_bought = sum(d["bought"] * price for d in wallet_data.values())
+    per_wallet_usd = {w: round(d["bought"] * price, 2) for w, d in wallet_data.items()}
+    total_usd_bought = sum(per_wallet_usd.values())
+    avg_usd_bought = total_usd_bought / n_wallets if n_wallets else 0.0
+
     b_score = breadth_score(n_wallets)
     c_score = conviction_score_for_buyers(wallet_data)
     u_score = usd_score(total_usd_bought)
-    pressure = get_top_holder_pressure(mint, helius_url)
+    pressure = get_top_holder_pressure(mint, helius_url, price_usd=price, top_n=20)
     p_score = pressure["score_0_100"]
 
     composite = 0.30 * b_score + 0.20 * c_score + 0.20 * u_score + 0.30 * p_score
@@ -414,9 +477,15 @@ def score_token(mint: str, wallet_data: dict, helius_url: str) -> dict:
         },
         "n_wallets_bought": n_wallets,
         "total_usd_bought_est": round(total_usd_bought, 2),
+        "avg_usd_bought_est": round(avg_usd_bought, 2),
+        "per_wallet_usd_bought": per_wallet_usd,
         "wallets": {w: {k: v for k, v in d.items()} for w, d in wallet_data.items()},
         "market": market,
         "top_holder_windows": pressure.get("windows", {}),
+        "top_holder_buying": pressure.get("buying", {"count": 0, "usd": 0.0}),
+        "top_holder_selling": pressure.get("selling", {"count": 0, "usd": 0.0}),
+        "top_holder_n_considered": pressure.get("top_n_considered", 20),
+        "top_holder_headline_window": pressure.get("headline_window", "1d"),
         "flags": flags,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -452,15 +521,29 @@ def run_alert_scan(wallets: list, helius_url: str, lookback_hours: float = 1.25,
 def send_telegram_alert(bot_token: str, chat_id: str, alert: dict):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     flags_text = "\n".join(alert["flags"]) if alert["flags"] else "—"
+
+    n_considered = alert.get("top_holder_n_considered", 20)
+    window = alert.get("top_holder_headline_window", "1d")
+    buying = alert.get("top_holder_buying", {"count": 0, "usd": 0.0})
+    selling = alert.get("top_holder_selling", {"count": 0, "usd": 0.0})
+
+    per_wallet = alert.get("per_wallet_usd_bought", {})
+    per_wallet_lines = "\n".join(
+        f"  {w[:6]}...{w[-4:]}: ${usd:,.0f}"
+        for w, usd in sorted(per_wallet.items(), key=lambda x: -x[1])
+    ) or "  —"
+
     text = (
         f"{alert['label']}  {alert['symbol']}  ({alert['composite_score']}/100)\n\n"
         f"Wallets bought: {alert['n_wallets_bought']}\n"
-        f"Est. USD bought: ${alert['total_usd_bought_est']:,.0f}\n"
-        f"Top-holder pressure: {alert['sub_scores']['top_holder_pressure']}/100\n"
+        f"Est. average USD bought: ${alert['avg_usd_bought_est']:,.0f}\n\n"
+        f"Top {n_considered} Holders Buying ({window}): {buying['count']} holders · ${buying['usd']:,.0f}\n"
+        f"Top {n_considered} Holders Selling ({window}): {selling['count']} holders · ${selling['usd']:,.0f}\n\n"
         f"Market cap: ${alert['market'].get('market_cap', 0):,.0f}\n"
         f"Liquidity: ${alert['market'].get('liquidity_usd', 0):,.0f}\n"
         f"Age: {alert['market'].get('age_days', '?')}d\n\n"
         f"Flags:\n{flags_text}\n\n"
+        f"USD bought by wallet:\n{per_wallet_lines}\n\n"
         f"Mint: {alert['mint']}\n"
         f"{alert['market'].get('pair_url', '')}"
     )
@@ -472,13 +555,25 @@ def send_telegram_alert(bot_token: str, chat_id: str, alert: dict):
 
 # ── optional: push to Discord ─────────────────────────────────────────────────
 def send_discord_alert(webhook_url: str, alert: dict):
+    n_considered = alert.get("top_holder_n_considered", 20)
+    window = alert.get("top_holder_headline_window", "1d")
+    buying = alert.get("top_holder_buying", {"count": 0, "usd": 0.0})
+    selling = alert.get("top_holder_selling", {"count": 0, "usd": 0.0})
+
+    per_wallet = alert.get("per_wallet_usd_bought", {})
+    per_wallet_lines = "\n".join(
+        f"`{w[:6]}...{w[-4:]}`: ${usd:,.0f}"
+        for w, usd in sorted(per_wallet.items(), key=lambda x: -x[1])
+    ) or "—"
+
     embed = {
         "title": f"{alert['label']}  —  {alert['symbol']}  ({alert['composite_score']}/100)",
         "url": alert["market"].get("pair_url", ""),
         "description": (
             f"**{alert['n_wallets_bought']}** watchlist wallets bought · "
-            f"~${alert['total_usd_bought_est']:,.0f} est. bought\n"
-            f"Top-holder pressure: {alert['sub_scores']['top_holder_pressure']}/100\n"
+            f"~${alert['avg_usd_bought_est']:,.0f} est. average USD bought\n\n"
+            f"**Top {n_considered} Holders Buying** ({window}): {buying['count']} holders · ${buying['usd']:,.0f}\n"
+            f"**Top {n_considered} Holders Selling** ({window}): {selling['count']} holders · ${selling['usd']:,.0f}\n\n"
             + ("\n".join(alert["flags"]) if alert["flags"] else "")
         ),
         "fields": [
@@ -486,6 +581,7 @@ def send_discord_alert(webhook_url: str, alert: dict):
             {"name": "Market Cap", "value": f"${alert['market'].get('market_cap', 0):,.0f}", "inline": True},
             {"name": "Liquidity", "value": f"${alert['market'].get('liquidity_usd', 0):,.0f}", "inline": True},
             {"name": "Age", "value": f"{alert['market'].get('age_days', '?')}d", "inline": True},
+            {"name": "USD bought by wallet", "value": per_wallet_lines, "inline": False},
         ],
     }
     try:
