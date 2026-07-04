@@ -68,8 +68,13 @@ def fetch_signatures(wallet: str, helius_url: str, limit: int = 150) -> list:
     try:
         r = requests.post(helius_url, json=payload, timeout=30)
         r.raise_for_status()
-        return r.json().get("result", [])
-    except Exception:
+        data = r.json()
+        if "error" in data:
+            print(f"  [Helius error] getSignaturesForAddress {wallet[:8]}...: {data['error']}")
+            return []
+        return data.get("result", [])
+    except Exception as e:
+        print(f"  [Request failed] getSignaturesForAddress {wallet[:8]}...: {e}")
         return []
 
 
@@ -79,8 +84,13 @@ def fetch_transaction(sig: str, helius_url: str):
     try:
         r = requests.post(helius_url, json=payload, timeout=30)
         r.raise_for_status()
-        return r.json().get("result")
-    except Exception:
+        data = r.json()
+        if "error" in data:
+            print(f"  [Helius error] getTransaction {sig[:12]}...: {data['error']}")
+            return None
+        return data.get("result")
+    except Exception as e:
+        print(f"  [Request failed] getTransaction {sig[:12]}...: {e}")
         return None
 
 
@@ -120,12 +130,14 @@ def get_token_supply(mint: str, helius_url: str) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — SCAN WATCHLIST FOR NET TOKEN DELTAS (bought AND sold, per mint)
 # ══════════════════════════════════════════════════════════════════════════════
-def scan_wallet_token_deltas(wallet: str, helius_url: str, cutoff_ts: int) -> dict:
+def scan_wallet_token_deltas(wallet: str, helius_url: str, cutoff_ts: int):
     """
-    Returns {mint: {bought, sold, buy_txs, sell_txs, last_buy_ts}} for everything
+    Returns (deltas, total_signatures_fetched).
+    deltas = {mint: {bought, sold, buy_txs, sell_txs, last_buy_ts}} for everything
     this wallet touched since cutoff_ts. Unlike the Tab 3/4 scanner (which only
     tracks inflows), this also tracks outflows so we can tell buy-and-hold apart
-    from buy-and-dump.
+    from buy-and-dump. total_signatures_fetched lets the caller distinguish
+    "wallet was just quiet" from "API call returned nothing at all."
     """
     out = defaultdict(lambda: {"bought": 0.0, "sold": 0.0, "buy_txs": 0, "sell_txs": 0, "last_buy_ts": 0})
     sigs = fetch_signatures(wallet, helius_url, limit=150)
@@ -163,7 +175,7 @@ def scan_wallet_token_deltas(wallet: str, helius_url: str, cutoff_ts: int) -> di
 
         time.sleep(0.07)
 
-    return out
+    return out, len(sigs)
 
 
 def aggregate_watchlist_activity(wallets: list, helius_url: str, lookback_hours: int) -> dict:
@@ -171,11 +183,29 @@ def aggregate_watchlist_activity(wallets: list, helius_url: str, lookback_hours:
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp())
     token_activity = defaultdict(dict)
 
+    wallets_with_zero_sigs = 0
+
     for wallet in wallets:
-        deltas = scan_wallet_token_deltas(wallet, helius_url, cutoff_ts)
+        deltas, sig_count = scan_wallet_token_deltas(wallet, helius_url, cutoff_ts)
+        if sig_count == 0:
+            wallets_with_zero_sigs += 1
+
         for mint, d in deltas.items():
             if d["bought"] > 0:
                 token_activity[mint][wallet] = d
+
+    # ── diagnostic: tells you whether "0 candidates" means quiet market vs broken API ──
+    print(f"[diagnostic] {len(wallets) - wallets_with_zero_sigs}/{len(wallets)} wallets "
+          f"returned at least one signature (any age) from Helius.")
+    if wallets_with_zero_sigs == len(wallets):
+        print("[diagnostic] ⚠️ EVERY wallet returned zero signatures. This almost certainly "
+              "means the Helius API key/URL is invalid, rate-limited, or misconfigured — "
+              f"not that all {len(wallets)} real wallets have zero transaction history ever. "
+              "Check HELIUS_API_KEY.")
+    elif wallets_with_zero_sigs > len(wallets) * 0.5:
+        print(f"[diagnostic] ⚠️ Over half your wallets ({wallets_with_zero_sigs}/{len(wallets)}) "
+              "returned zero signatures — worth double-checking those addresses are valid "
+              "and the API key isn't being rate-limited mid-run.")
 
     return token_activity
 
@@ -609,3 +639,4 @@ if __name__ == "__main__":
 
     finally:
         release_lock()
+
