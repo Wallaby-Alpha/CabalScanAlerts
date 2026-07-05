@@ -22,6 +22,8 @@ Env vars expected when run as a script:
     ALERT_THRESHOLD       - optional, default 55
     RENOTIFY_SCORE_DELTA  - optional, default 15  (re-alert if score climbs this much since last alert)
     RENOTIFY_WALLET_DELTA - optional, default 2   (re-alert if this many more wallets joined in)
+    MIN_USD_PER_WALLET    - optional, default 50  (buys/holder-moves below this $ amount don't count)
+    TOP_HOLDERS_N         - optional, default 20  (how many top holders to consider for pressure/grade)
 
 State/lock files (created next to this script, safe to .gitignore):
     seen_alerts.json      - tracks the score/wallet-count at the time each mint was last notified,
@@ -271,10 +273,13 @@ def conviction_score(bought: float, sold: float, buy_txs: int, sell_txs: int) ->
 
 def get_top_holder_pressure(mint: str, helius_url: str, price_usd: float = 0.0,
                              top_n: int = 20, min_pct: float = 0.1,
-                             headline_window: str = "1d") -> dict:
+                             headline_window: str = "1d", min_usd_per_holder: float = 50.0) -> dict:
     """
     'Top holders' = the top `top_n` token accounts by balance (default 20),
-    with known exchange wallets excluded (see EXCHANGE_WALLETS).
+    with known exchange wallets excluded (see EXCHANGE_WALLETS). A holder only
+    counts toward `buying`/`selling` if their net USD move in `headline_window`
+    clears `min_usd_per_holder` — filters out dust moves/internal transfers
+    that would otherwise muddy the buying/selling counts.
 
     Returns:
       score_0_100        - blended conviction score (0=heavy net selling, 50=neutral, 100=heavy net buying),
@@ -372,12 +377,14 @@ def get_top_holder_pressure(mint: str, helius_url: str, price_usd: float = 0.0,
     for wallet, wf in wallet_window_flows.items():
         flow = wf.get(headline_window, {})
         net = flow.get("bought", 0) - flow.get("sold", 0)
-        if net > 0:
+        bought_usd = flow.get("bought", 0) * price_usd
+        sold_usd = flow.get("sold", 0) * price_usd
+        if net > 0 and bought_usd >= min_usd_per_holder:
             buying_count += 1
-            buying_usd += flow["bought"] * price_usd
-        elif net < 0:
+            buying_usd += bought_usd
+        elif net < 0 and sold_usd >= min_usd_per_holder:
             selling_count += 1
-            selling_usd += flow["sold"] * price_usd
+            selling_usd += sold_usd
 
     return {
         "score_0_100": score_0_100,
@@ -424,20 +431,67 @@ def score_label(score: float) -> str:
     return "⚪ Low Signal"
 
 
-def score_token(mint: str, wallet_data: dict, helius_url: str) -> dict:
-    n_wallets = len(wallet_data)
+def top_holder_grade(buying: dict, selling: dict) -> dict:
+    """
+    A+ (very bullish) .. C (neutral) .. F (very bearish) grade for top-holder
+    behavior, separate from the 0-100 composite sub-score. Blends:
+      - participation ratio (buyers vs sellers, by headcount) — breadth of consensus,
+        harder for one whale to single-handedly swing
+      - volume ratio (USD bought vs sold) — actual dollar conviction, weighted higher
+        since it matters more for real price impact
+    Weighted 40% participation / 60% volume. Both `buying`/`selling` dicts are
+    expected to already have the $-minimum dust filter applied.
+    """
+    b_count, b_usd = buying["count"], buying["usd"]
+    s_count, s_usd = selling["count"], selling["usd"]
+    total_count, total_usd = b_count + s_count, b_usd + s_usd
+
+    if total_count == 0:
+        return {"grade": "—", "label": "No qualifying top-holder activity in window", "score": 0.0}
+
+    participation_ratio = (b_count - s_count) / total_count if total_count > 0 else 0
+    volume_ratio = (b_usd - s_usd) / total_usd if total_usd > 0 else 0
+    combined = round(100 * (0.4 * participation_ratio + 0.6 * volume_ratio), 1)
+
+    if combined >= 60:   grade, label = "A+", "Strong Accumulation"
+    elif combined >= 30: grade, label = "A", "Accumulation"
+    elif combined >= 10: grade, label = "B", "Leaning Bullish"
+    elif combined >= -9: grade, label = "C", "Neutral / Mixed"
+    elif combined >= -29: grade, label = "D", "Leaning Bearish"
+    elif combined >= -59: grade, label = "F", "Distribution"
+    else:                 grade, label = "F", "Heavy Distribution"
+
+    return {"grade": grade, "label": label, "score": combined}
+
+
+def score_token(mint: str, wallet_data: dict, helius_url: str, min_wallets: int = 2,
+                 min_usd_per_wallet: float = 50.0, top_n_holders: int = 20) -> dict | None:
     market = get_token_market_data(mint) or {}
     price = market.get("price_usd", 0)
 
-    per_wallet_usd = {w: round(d["bought"] * price, 2) for w, d in wallet_data.items()}
+    # Apply the $-minimum before counting anything — a $2 "buy" (dust/rounding/
+    # airdrop-adjacent transfer) shouldn't count the same as a real purchase.
+    per_wallet_usd_all = {w: round(d["bought"] * price, 2) for w, d in wallet_data.items()}
+    dust_filtered = {w: d for w, d in wallet_data.items() if per_wallet_usd_all[w] >= min_usd_per_wallet}
+    n_dust_excluded = len(wallet_data) - len(dust_filtered)
+
+    if len(dust_filtered) < min_wallets:
+        return None  # doesn't hold up as a coordinated-buy signal once dust is stripped out
+
+    wallet_data = dust_filtered
+    n_wallets = len(wallet_data)
+    per_wallet_usd = {w: per_wallet_usd_all[w] for w in wallet_data}
     total_usd_bought = sum(per_wallet_usd.values())
     avg_usd_bought = total_usd_bought / n_wallets if n_wallets else 0.0
 
     b_score = breadth_score(n_wallets)
     c_score = conviction_score_for_buyers(wallet_data)
     u_score = usd_score(total_usd_bought)
-    pressure = get_top_holder_pressure(mint, helius_url, price_usd=price, top_n=20)
+    pressure = get_top_holder_pressure(mint, helius_url, price_usd=price, top_n=top_n_holders,
+                                        min_usd_per_holder=min_usd_per_wallet)
     p_score = pressure["score_0_100"]
+    holder_grade = top_holder_grade(pressure.get("buying", {"count": 0, "usd": 0.0}),
+                                     pressure.get("selling", {"count": 0, "usd": 0.0}))
 
     composite = 0.30 * b_score + 0.20 * c_score + 0.20 * u_score + 0.30 * p_score
 
@@ -463,6 +517,9 @@ def score_token(mint: str, wallet_data: dict, helius_url: str) -> dict:
     if pressure["n_holders"] == 0:
         flags.append("ℹ️ Could not resolve top-holder wallets — pressure score defaulted to neutral")
 
+    if n_dust_excluded > 0:
+        flags.append(f"ℹ️ {n_dust_excluded} sub-${min_usd_per_wallet:.0f} buy(s) excluded as dust")
+
     return {
         "mint": mint,
         "symbol": market.get("symbol", mint[:8]),
@@ -475,7 +532,9 @@ def score_token(mint: str, wallet_data: dict, helius_url: str) -> dict:
             "usd_size": u_score,
             "top_holder_pressure": p_score,
         },
+        "top_holder_grade": holder_grade,
         "n_wallets_bought": n_wallets,
+        "n_dust_wallets_excluded": n_dust_excluded,
         "total_usd_bought_est": round(total_usd_bought, 2),
         "avg_usd_bought_est": round(avg_usd_bought, 2),
         "per_wallet_usd_bought": per_wallet_usd,
@@ -495,13 +554,17 @@ def score_token(mint: str, wallet_data: dict, helius_url: str) -> dict:
 # STEP 5 — ORCHESTRATION
 # ══════════════════════════════════════════════════════════════════════════════
 def run_alert_scan(wallets: list, helius_url: str, lookback_hours: float = 1.25,
-                    min_wallets: int = 2, alert_threshold: float = 55.0) -> dict:
+                    min_wallets: int = 2, alert_threshold: float = 55.0,
+                    min_usd_per_wallet: float = 50.0, top_n_holders: int = 20) -> dict:
     activity = aggregate_watchlist_activity(wallets, helius_url, lookback_hours)
     candidates = {m: w for m, w in activity.items() if len(w) >= min_wallets}
 
     results = []
     for mint, wallet_data in candidates.items():
-        results.append(score_token(mint, wallet_data, helius_url))
+        r = score_token(mint, wallet_data, helius_url, min_wallets=min_wallets,
+                         min_usd_per_wallet=min_usd_per_wallet, top_n_holders=top_n_holders)
+        if r is not None:  # None means it didn't hold up once dust buys were filtered out
+            results.append(r)
 
     results.sort(key=lambda x: -x["composite_score"])
     alerts = [r for r in results if r["composite_score"] >= alert_threshold]
@@ -510,6 +573,8 @@ def run_alert_scan(wallets: list, helius_url: str, lookback_hours: float = 1.25,
         "scan_time": datetime.now(timezone.utc).isoformat(),
         "lookback_hours": lookback_hours,
         "wallets_scanned": len(wallets),
+        "min_usd_per_wallet": min_usd_per_wallet,
+        "top_n_holders": top_n_holders,
         "candidates_found": len(results),
         "alerts_triggered": len(alerts),
         "all_results": results,
@@ -526,6 +591,7 @@ def send_telegram_alert(bot_token: str, chat_id: str, alert: dict):
     window = alert.get("top_holder_headline_window", "1d")
     buying = alert.get("top_holder_buying", {"count": 0, "usd": 0.0})
     selling = alert.get("top_holder_selling", {"count": 0, "usd": 0.0})
+    grade = alert.get("top_holder_grade", {"grade": "—", "label": "N/A", "score": 0})
 
     per_wallet = alert.get("per_wallet_usd_bought", {})
     per_wallet_lines = "\n".join(
@@ -537,6 +603,7 @@ def send_telegram_alert(bot_token: str, chat_id: str, alert: dict):
         f"{alert['label']}  {alert['symbol']}  ({alert['composite_score']}/100)\n\n"
         f"Wallets bought: {alert['n_wallets_bought']}\n"
         f"Est. average USD bought: ${alert['avg_usd_bought_est']:,.0f}\n\n"
+        f"Top Holder Grade: {grade['grade']} ({grade['label']})\n"
         f"Top {n_considered} Holders Buying ({window}): {buying['count']} holders · ${buying['usd']:,.0f}\n"
         f"Top {n_considered} Holders Selling ({window}): {selling['count']} holders · ${selling['usd']:,.0f}\n\n"
         f"Market cap: ${alert['market'].get('market_cap', 0):,.0f}\n"
@@ -559,6 +626,7 @@ def send_discord_alert(webhook_url: str, alert: dict):
     window = alert.get("top_holder_headline_window", "1d")
     buying = alert.get("top_holder_buying", {"count": 0, "usd": 0.0})
     selling = alert.get("top_holder_selling", {"count": 0, "usd": 0.0})
+    grade = alert.get("top_holder_grade", {"grade": "—", "label": "N/A", "score": 0})
 
     per_wallet = alert.get("per_wallet_usd_bought", {})
     per_wallet_lines = "\n".join(
@@ -572,6 +640,7 @@ def send_discord_alert(webhook_url: str, alert: dict):
         "description": (
             f"**{alert['n_wallets_bought']}** watchlist wallets bought · "
             f"~${alert['avg_usd_bought_est']:,.0f} est. average USD bought\n\n"
+            f"**Top Holder Grade:** {grade['grade']} ({grade['label']})\n"
             f"**Top {n_considered} Holders Buying** ({window}): {buying['count']} holders · ${buying['usd']:,.0f}\n"
             f"**Top {n_considered} Holders Selling** ({window}): {selling['count']} holders · ${selling['usd']:,.0f}\n\n"
             + ("\n".join(alert["flags"]) if alert["flags"] else "")
@@ -706,8 +775,11 @@ if __name__ == "__main__":
         threshold = float(os.environ.get("ALERT_THRESHOLD", 55))
         score_delta = float(os.environ.get("RENOTIFY_SCORE_DELTA", 15))
         wallet_delta = int(os.environ.get("RENOTIFY_WALLET_DELTA", 2))
+        min_usd_per_wallet = float(os.environ.get("MIN_USD_PER_WALLET", 50))
+        top_n_holders = int(os.environ.get("TOP_HOLDERS_N", 20))
 
-        result = run_alert_scan(PRESET_WALLETS, helius_url, lookback, min_wallets, threshold)
+        result = run_alert_scan(PRESET_WALLETS, helius_url, lookback, min_wallets, threshold,
+                                 min_usd_per_wallet=min_usd_per_wallet, top_n_holders=top_n_holders)
 
         # Full results always written — this is what a Streamlit "Alerts" tab reads,
         # so it should reflect everything from this run, deduped or not.
