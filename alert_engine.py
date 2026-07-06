@@ -194,6 +194,27 @@ def scan_wallet_token_deltas(wallet: str, helius_url: str, cutoff_ts: int):
     return out, len(sigs)
 
 
+def scan_wallets_for_mint(mint: str, wallets: list, helius_url: str, lookback_hours: float = 24) -> dict:
+    """
+    Like aggregate_watchlist_activity, but targeted at one already-known mint
+    instead of open-ended discovery across a wallet's whole recent history.
+    Used for on-demand "look up this token" reports (e.g. an app.py tab where
+    the user pastes a CA) rather than the cron/candidate-discovery scan.
+
+    Returns {wallet: {bought, sold, buy_txs, sell_txs, last_buy_ts}} for wallets
+    that bought this specific mint in the window (bought > 0).
+    """
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp())
+    wallet_data = {}
+    for wallet in wallets:
+        deltas, _ = scan_wallet_token_deltas(wallet, helius_url, cutoff_ts)
+        d = deltas.get(mint)
+        if d and d["bought"] > 0:
+            wallet_data[wallet] = d
+        time.sleep(0.1)
+    return wallet_data
+
+
 def aggregate_watchlist_activity(wallets: list, helius_url: str, lookback_hours: int) -> dict:
     """{mint: {wallet: {bought, sold, buy_txs, sell_txs, last_buy_ts}}} — buys only."""
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp())
