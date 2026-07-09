@@ -640,7 +640,39 @@ def send_telegram_alert(bot_token: str, chat_id: str, alert: dict):
     except Exception:
         pass
 
+def send_telegram_message(bot_token: str, chat_id: str, text: str):
+    """Plain-text Telegram send, used for heartbeats and error alerts (not scored token alerts)."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
+    except Exception:
+        pass
 
+
+def send_daily_heartbeat(bot_token: str, chat_id: str, result: dict, path: str = "heartbeat_state.json"):
+    """Sends one 'still alive' message per calendar day (UTC), not every run."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+
+    if state.get("last_heartbeat_date") == today:
+        return  # already sent today
+
+    text = (
+        f"✅ Scanner heartbeat — still running.\n"
+        f"Last scan: {result['scan_time']}\n"
+        f"Wallets scanned: {result['wallets_scanned']}\n"
+        f"Candidates found: {result['candidates_found']}\n"
+        f"Alerts triggered: {result['alerts_triggered']}"
+    )
+    send_telegram_message(bot_token, chat_id, text)
+    state["last_heartbeat_date"] = today
+    with open(path, "w") as f:
+        json.dump(state, f)
+      
 # ── optional: push to Discord ─────────────────────────────────────────────────
 def send_discord_alert(webhook_url: str, alert: dict):
     n_considered = alert.get("top_holder_n_considered", 20)
@@ -802,8 +834,6 @@ if __name__ == "__main__":
         result = run_alert_scan(PRESET_WALLETS, helius_url, lookback, min_wallets, threshold,
                                  min_usd_per_wallet=min_usd_per_wallet, top_n_holders=top_n_holders)
 
-        # Full results always written — this is what a Streamlit "Alerts" tab reads,
-        # so it should reflect everything from this run, deduped or not.
         with open("alerts_output.json", "w") as f:
             json.dump(result, f, indent=2)
 
@@ -825,6 +855,17 @@ if __name__ == "__main__":
         if tg_token and tg_chat_id:
             for a in to_notify:
                 send_telegram_alert(tg_token, tg_chat_id, a)
+            send_daily_heartbeat(tg_token, tg_chat_id, result)
+
+    except Exception as e:
+        tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        if tg_token and tg_chat_id:
+            send_telegram_message(
+                tg_token, tg_chat_id,
+                f"🔴 Scanner crashed on this run:\n{type(e).__name__}: {e}"
+            )
+        raise  # still exit non-zero so it shows up as an error in scanner.log / cron
 
     finally:
         release_lock()
